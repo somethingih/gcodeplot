@@ -1,0 +1,14 @@
+Inkscape install (single-folder copy)
+
+1. Copy this entire folder (`inkscape-gcodeplot`) into your Inkscape user extensions directory.
+2. Restart Inkscape.
+
+Windows default user extensions path:
+%APPDATA%\inkscape\extensions
+
+Result:
+- The extension appears in Save As as `3-axis gcode plotter (*.gcode)`.
+
+Notes:
+- Keep the folder name exactly `inkscape-gcodeplot` (the `.inx` file references this path).
+- This bundle uses Ender 3 V2 defaults by default.
