@@ -4,6 +4,8 @@ import re
 import sys
 import getopt
 import math
+import os
+import io
 import xml.etree.ElementTree as ET
 import gcodeplotutils.anneal as anneal
 import svgpath.parser as parser
@@ -40,6 +42,110 @@ ENDER3V2_INIT_CODE = "G21; millimeters|" \
                      "G28; home all axes"
 ENDER3V2_END_CODE = "M400; wait for moves to finish|" \
                     "M84; disable steppers"
+EXTENSION_PREFS_PREFIX = "mobi.omegacentauri.gcodeplot."
+
+def askUserYesNo(title, message):
+    if sys.platform.startswith('win'):
+        try:
+            import ctypes
+            MB_YESNO = 0x00000004
+            MB_ICONQUESTION = 0x00000020
+            MB_TOPMOST = 0x00040000
+            return ctypes.windll.user32.MessageBoxW(None, message, title, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) == 6
+        except:
+            pass
+
+    try:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+        except:
+            import Tkinter as tk
+            import tkMessageBox as messagebox
+        root = tk.Tk()
+        root.withdraw()
+        answer = bool(messagebox.askyesno(title, message))
+        root.destroy()
+        return answer
+    except:
+        return None
+
+def showInfoMessage(title, message):
+    if sys.platform.startswith('win'):
+        try:
+            import ctypes
+            MB_OK = 0x00000000
+            MB_ICONINFORMATION = 0x00000040
+            MB_TOPMOST = 0x00040000
+            ctypes.windll.user32.MessageBoxW(None, message, title, MB_OK | MB_ICONINFORMATION | MB_TOPMOST)
+            return
+        except:
+            pass
+
+    try:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+        except:
+            import Tkinter as tk
+            import tkMessageBox as messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(title, message)
+        root.destroy()
+    except:
+        pass
+
+def inkscapePreferencesCandidates():
+    out = []
+    seen = set()
+
+    def add(path):
+        if path and path not in seen:
+            seen.add(path)
+            out.append(path)
+
+    profile = os.environ.get('INKSCAPE_PROFILE_DIR')
+    if profile:
+        add(os.path.join(profile, 'preferences.xml'))
+
+    appData = os.environ.get('APPDATA')
+    if appData:
+        add(os.path.join(appData, 'inkscape', 'preferences.xml'))
+        add(os.path.join(appData, 'Inkscape', 'preferences.xml'))
+
+    xdgConfig = os.environ.get('XDG_CONFIG_HOME')
+    if xdgConfig:
+        add(os.path.join(xdgConfig, 'inkscape', 'preferences.xml'))
+
+    home = os.path.expanduser('~')
+    add(os.path.join(home, '.config', 'inkscape', 'preferences.xml'))
+    add(os.path.join(home, '.var', 'app', 'org.inkscape.Inkscape', 'config', 'inkscape', 'preferences.xml'))
+    add(os.path.join(home, 'Library', 'Application Support', 'org.inkscape.Inkscape', 'config', 'inkscape', 'preferences.xml'))
+
+    return out
+
+def clearSavedExtensionDefaults(prefix=EXTENSION_PREFS_PREFIX):
+    pattern = re.compile(r'\s+' + re.escape(prefix) + r'[^=\s]+="[^"]*"')
+
+    for filename in inkscapePreferencesCandidates():
+        if not os.path.isfile(filename):
+            continue
+        try:
+            with io.open(filename, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except:
+            continue
+
+        newText, removed = pattern.subn('', text)
+        if removed <= 0:
+            continue
+
+        with io.open(filename, 'w', encoding='utf-8') as f:
+            f.write(newText)
+        return removed, filename
+
+    return 0, None
 
 class Plotter(object):
     def __init__(self, xyMin=(7,8), xyMax=(204,178),
@@ -500,7 +606,7 @@ def penColor(pens, pen):
     else:
         return (0.,0.,0.)
 
-def emitGcode(data, pens = {}, plotter=Plotter(), scalingMode=SCALE_NONE, align = None, tolerance=0, gcodePause="@pause", pauseAtStart = False, simulation = False, relCode = False, incHoming = True):
+def emitGcode(data, pens = {}, plotter=Plotter(), scalingMode=SCALE_NONE, align = None, tolerance=0, gcodePause="@pause", pauseAtStart = False, parkImageCenter=False, simulation = False, relCode = False, incHoming = True):
     if len(data) == 0:
         return None
 
@@ -533,6 +639,9 @@ def emitGcode(data, pens = {}, plotter=Plotter(), scalingMode=SCALE_NONE, align 
 
     if align is not None:
         scale.align(plotter, xyMin, xyMax, align)
+
+    sourceCenter = ((xyMin[0] + xyMax[0]) * 0.5, (xyMin[1] + xyMax[1]) * 0.5)
+    imageCenter = scale.scalePoint(sourceCenter)
 
     if not simulation:
         gcode = gcodeHeader(plotter)
@@ -638,6 +747,10 @@ def emitGcode(data, pens = {}, plotter=Plotter(), scalingMode=SCALE_NONE, align 
             if state.curXY is not None:
                 state.time += d / speed
             state.curXY = p
+
+    if parkImageCenter and not simulation:
+        penMove(False, plotter.moveSpeed, imageCenter)
+        gcode.append(gcodePause + ' align material at image center')
 
     for pen in sorted(data):
         if pen != 1:
@@ -802,6 +915,47 @@ def parseSVG(svgTree, tolerance=0.05, shader=None, strokeAll=False, pens=None, e
 
     return data
 
+def summarizeSVGContent(svgTree):
+    counts = {
+        'vector': 0,
+        'image': 0,
+        'text': 0,
+    }
+
+    vectorTags = {'path', 'circle', 'ellipse', 'line', 'polygon', 'polyline', 'rect'}
+    textTags = {'text', 'tspan', 'flowroot', 'flowpara', 'flowspan'}
+
+    for node in svgTree.iter():
+        if not isinstance(node.tag, str):
+            continue
+        tag = re.sub(r'.*}', '', node.tag).lower()
+        if tag in vectorTags:
+            counts['vector'] += 1
+        elif tag == 'image':
+            counts['image'] += 1
+        elif tag in textTags:
+            counts['text'] += 1
+
+    return counts
+
+def explainEmptySVG(svgTree, extractColor=None):
+    counts = summarizeSVGContent(svgTree)
+
+    if counts['vector'] == 0:
+        hints = []
+        if counts['image'] > 0:
+            hints.append("Raster <image> elements are not drawable paths. Convert with Inkscape Path > Trace Bitmap.")
+        if counts['text'] > 0:
+            hints.append("Text elements are not directly supported. Convert with Inkscape Path > Object to Path.")
+        if hints:
+            return "No points. " + " ".join(hints)
+        return "No points. SVG contains no drawable vector paths."
+
+    if extractColor is not None:
+        return "No points. Vector shapes were found, but none matched the selected extract color."
+
+    return "No points. Vector shapes were found, but none produced toolpaths with the current stroke/fill/shading settings."
+
 def getConfigOpts(filename):
     opts = []
     with open(filename) as f:
@@ -919,6 +1073,8 @@ if __name__ == '__main__':
  -w|--gcode-pause=cmd: gcode pause command [default: M0 in ender3v2 profile]
  -P|--pens=penfile: read output pens from penfile
  -U|--pause-at-start*: pause at start (can be included without any input file to manually move stuff)
+    --reset-defaults=true|false: open confirm dialog and clear saved GCodePlot dialog settings [default false]
+    --park-image-center=true|false: move to final image center at safe Z and pause for alignment [default false]
  -R|--extract-color=c: extract color (specified in SVG format , e.g., rgb(1,0,0) or #ff0000 or red)
     --machine-profile=name: machine defaults preset [ender3v2 (default), legacy]
     --comment-delimiters=xy: one or two characters specifying comment delimiters, e.g., ";" or "()"
@@ -971,6 +1127,9 @@ if __name__ == '__main__':
     sendAndSave = False
     directionAngle = None
     relCode = False
+    resetDefaults = False
+    resetDefaultsConfirm = False
+    parkImageCenter = False
     incHoming = True
 
     def maybeNone(a):
@@ -986,7 +1145,7 @@ if __name__ == '__main__':
                         'pause-at-start', 'no-pause-at-start', 'min-x=', 'max-x=', 'min-y=', 'max-y=',
                         'no-shading-avoid-outline', 'shading-darkest=', 'shading-lightest=', 'stroke-all', 'no-stroke-all', 'gcode-pause', 'dump-options', 'tab=', 'extract-color=', 'sort', 'no-sort', 'simulation', 'no-simulation', 'tool-offset=', 'overcut=',
                         'boolean-shading-crosshatch=', 'boolean-sort=', 'tool-mode=', 'send-and-save=', 'direction=', 'lift-command=', 'down-command=',
-                        'init-code=', 'comment-delimiters=', 'end-code=', 'rel-code=', 'machine-profile=', 'min-path-length=', 'curve-smoothing=' ], )
+                        'init-code=', 'comment-delimiters=', 'end-code=', 'rel-code=', 'machine-profile=', 'min-path-length=', 'curve-smoothing=', 'park-image-center=', 'reset-defaults=', 'reset-defaults-confirm=' ], )
 
         if len(args) + len(opts) == 0:
             raise getopt.GetoptError("invalid commandline")
@@ -1182,6 +1341,12 @@ if __name__ == '__main__':
                 plotter.comment = maybeNone(arg)
             elif opt == "--rel-code":
                 relCode = arg == "true"
+            elif opt == "--reset-defaults":
+                resetDefaults = arg == "true"
+            elif opt == "--reset-defaults-confirm":
+                resetDefaultsConfirm = arg == "true"
+            elif opt == "--park-image-center":
+                parkImageCenter = arg == "true"
             elif opt == "--inc-homing":
                 incHoming = arg == "true"
             elif opt == "--machine-profile":
@@ -1194,6 +1359,34 @@ if __name__ == '__main__':
         sys.stderr.write(str(e)+"\n")
         help(error=True)
         sys.exit(2)
+
+    if resetDefaults:
+        interactiveReset = not resetDefaultsConfirm
+        confirmed = True if resetDefaultsConfirm else askUserYesNo(
+            "GCodePlot",
+            "Reset all saved GCodePlot dialog settings to defaults?\n\nThis clears persisted settings in Inkscape preferences."
+        )
+
+        if confirmed is None:
+            sys.stderr.write("Could not open reset confirmation dialog. Use --reset-defaults-confirm=true to force reset.\n")
+            sys.exit(2)
+
+        if not confirmed:
+            sys.stderr.write("Reset defaults canceled.\n")
+            sys.exit(1)
+
+        removedSettings, prefsFile = clearSavedExtensionDefaults()
+        if removedSettings > 0:
+            if interactiveReset:
+                showInfoMessage("GCodePlot", "Saved GCodePlot settings were reset to defaults.\nRe-open the dialog to continue.")
+            if not quiet:
+                sys.stderr.write("Cleared %d saved setting(s) from %s\n" % (removedSettings, prefsFile))
+        else:
+            if interactiveReset:
+                showInfoMessage("GCodePlot", "No saved GCodePlot settings were found to reset.")
+            if not quiet:
+                sys.stderr.write("No saved GCodePlot settings were found to reset.\n")
+        sys.exit(1)
 
     try:
         machineDefaults = getMachineProfileDefaults(machineProfile)
@@ -1279,6 +1472,8 @@ if __name__ == '__main__':
         print('optimization-time=%g' % (optimizationTime))
         print('sort' if sortPaths else 'no-sort')
         print('pause-at-start' if pauseAtStart else 'no-pause-at-start')
+        print('reset-defaults=' + ('true' if resetDefaults else 'false'))
+        print('park-image-center=' + ('true' if parkImageCenter else 'false'))
         print('extract-color=all' if extractColor is None else 'extract-color=rgb(%.3f,%.3f,%.3f)' % tuple(extractColor))
         print('tool-offset=%.3f' % toolOffset)
         print('overcut=%.3f' % overcut)
@@ -1371,6 +1566,13 @@ if __name__ == '__main__':
     if removedSegments > 0 and not quiet:
         sys.stderr.write("Filtered out %d short path segments (< %.3f mm).\n" % (removedSegments, minPathLength))
 
+    if len(penData) == 0 and svgTree is not None:
+        if removedSegments > 0:
+            sys.stderr.write("No points. All path segments were filtered out by min-path-length %.3f mm.\n" % minPathLength)
+        else:
+            sys.stderr.write(explainEmptySVG(svgTree, extractColor=extractColor) + "\n")
+        sys.exit(1)
+
     if len(penData) > 1:
         sys.stderr.write("Uses the following pens:\n")
         for pen in sorted(penData):
@@ -1380,7 +1582,7 @@ if __name__ == '__main__':
         g = emitHPGL(penData, pens=pens)
     else:
         g = emitGcode(penData, align=align, scalingMode=scalingMode, tolerance=tolerance,
-                plotter=plotter, gcodePause=gcodePause, pens=pens, pauseAtStart=pauseAtStart, simulation=svgSimulation, relCode = relCode, incHoming = incHoming)
+                plotter=plotter, gcodePause=gcodePause, pens=pens, pauseAtStart=pauseAtStart, parkImageCenter=parkImageCenter, simulation=svgSimulation, relCode = relCode, incHoming = incHoming)
 
     if g:
         dump = True

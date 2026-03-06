@@ -630,6 +630,47 @@ def parseSVG(svgTree, tolerance=0.05, shader=None, strokeAll=False, pens=None, e
 
     return data
 
+def summarizeSVGContent(svgTree):
+    counts = {
+        'vector': 0,
+        'image': 0,
+        'text': 0,
+    }
+
+    vectorTags = {'path', 'circle', 'ellipse', 'line', 'polygon', 'polyline', 'rect'}
+    textTags = {'text', 'tspan', 'flowroot', 'flowpara', 'flowspan'}
+
+    for node in svgTree.iter():
+        if not isinstance(node.tag, str):
+            continue
+        tag = re.sub(r'.*}', '', node.tag).lower()
+        if tag in vectorTags:
+            counts['vector'] += 1
+        elif tag == 'image':
+            counts['image'] += 1
+        elif tag in textTags:
+            counts['text'] += 1
+
+    return counts
+
+def explainEmptySVG(svgTree, extractColor=None):
+    counts = summarizeSVGContent(svgTree)
+
+    if counts['vector'] == 0:
+        hints = []
+        if counts['image'] > 0:
+            hints.append("Raster <image> elements are not drawable paths. Convert with Inkscape Path > Trace Bitmap.")
+        if counts['text'] > 0:
+            hints.append("Text elements are not directly supported. Convert with Inkscape Path > Object to Path.")
+        if hints:
+            return "No points. " + " ".join(hints)
+        return "No points. SVG contains no drawable vector paths."
+
+    if extractColor is not None:
+        return "No points. Vector shapes were found, but none matched the selected extract color."
+
+    return "No points. Vector shapes were found, but none produced toolpaths with the current stroke/fill/shading settings."
+
 def getConfigOpts(filename):
     opts = []
     with open(filename) as f:
@@ -1137,6 +1178,10 @@ if __name__ == '__main__':
         for pen in penData:
             penData[pen] = directionalize(penData[pen], directionAngle)
         penData = removePenBob(penData)
+
+    if len(penData) == 0 and svgTree is not None:
+        sys.stderr.write(explainEmptySVG(svgTree, extractColor=extractColor) + "\n")
+        sys.exit(1)
 
     if len(penData) > 1:
         sys.stderr.write("Uses the following pens:\n")
